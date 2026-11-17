@@ -57,7 +57,8 @@ Les logs sont écrits dans `digest.log`.
 | Variable | Défaut | Rôle |
 |---|---|---|
 | `LLM_MODEL` | `qwen3.5:4b` | modèle Ollama |
-| `NUM_CTX` | `8192` | taille du contexte ; plus grand = plus de RAM |
+| `NUM_CTX` | `6144` | taille du contexte ; plus grand = plus de RAM (trop petit : candidats réduits automatiquement) |
+| `KEEP_ALIVE` | `0` | `0` = modèle déchargé après chaque appel (≈1 Go de RAM en moins) |
 | `MAX_CANDIDATES` | `60` | sujets montrés au modèle pour la sélection |
 | `THINK` | `0` | mode « réflexion » de qwen3.5 (très lent sur CPU) |
 | `NUM_STORIES` | `5` | nombre d'actus dans l'email |

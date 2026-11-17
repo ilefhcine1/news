@@ -17,6 +17,7 @@ import datetime as dt
 import html
 import json
 import logging
+import math
 import os
 import re
 import smtplib
@@ -87,8 +88,9 @@ FEEDS = {
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen3.5:4b")
 MAX_CANDIDATES = int(os.getenv("MAX_CANDIDATES", "60"))   # sujets montrés au modèle pour la sélection
-NUM_CTX = int(os.getenv("NUM_CTX", "8192"))               # taille du contexte (plus grand = plus de RAM)
+NUM_CTX = int(os.getenv("NUM_CTX", "6144"))               # taille du contexte (plus grand = plus de RAM)
 THINK = os.getenv("THINK", "0") == "1"                    # mode « réflexion » de qwen3.5 (très lent sur CPU)
+KEEP_ALIVE = os.getenv("KEEP_ALIVE", "0")                 # "0" = RAM libérée après chaque appel ; "5m" = plus rapide
 
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "26"))
 NUM_STORIES = int(os.getenv("NUM_STORIES", "5"))
@@ -125,6 +127,8 @@ STOPWORDS = set(
     "the a an and or of to in on for with from by at as is are was were be been "
     "new how why what this that its it into after over says said about more than "
     "will can could may your you their they has have had not but "
+    "one two first few let his her thing year years earlier today week month just also now get like make "
+    "article url comment comments point points https http www com news ycombinator item "
     "le la les un une des du de et ou en au aux pour par sur dans avec est sont".split()
 )
 
@@ -242,25 +246,70 @@ def collect() -> list[dict]:
 
 # ------------------------------------------------------------ 2. regroupement ---
 
+SIM_THRESHOLD = 0.28  # calibré sur des données réelles : vrais doublons ≥ 0,29, faux < 0,28
+BOILERPLATE_RE = re.compile(r"(Article URL|Comments URL|Points|# Comments):?\s*\S*")  # extraits Hacker News
 
-def group_stories(items: list[dict], threshold: float = 0.5) -> list[dict]:
-    """Regroupe les articles qui parlent du même sujet (mots-clés communs dans les titres)."""
+
+def outlet(item: dict) -> str:
+    """Le média réel (domaine du lien) : TechCrunch et TechCrunch AI comptent pour un seul média."""
+    netloc = urlsplit(item["link"]).netloc
+    return netloc[4:] if netloc.startswith("www.") else netloc
+
+
+def item_tokens(item: dict) -> set[str]:
+    snippet = BOILERPLATE_RE.sub(" ", item["snippet"][:250])
+    return {t for t in title_tokens(f"{item['title']} {snippet}") if not t.isdigit()}
+
+
+def similarity(a: set[str], b: set[str], idf: dict[str, float]) -> float:
+    """Part de mots-clés communs, les mots rares pesant plus que les mots fréquents."""
+    shared = a & b
+    if len(shared) < 3:
+        return 0.0
+    weight = lambda s: sum(idf.get(w, 0.0) for w in s)  # noqa: E731
+    return weight(shared) / max(1e-9, min(weight(a), weight(b)))
+
+
+def same_story(a: dict, b: dict) -> bool:
+    """Deux groupes parlent-ils du même événement ?"""
+    idf = a.get("idf") or b.get("idf") or {}
+    ta = a.get("toks") or [item_tokens(i) for i in a["items"]]
+    tb = b.get("toks") or [item_tokens(i) for i in b["items"]]
+    return any(similarity(x, y, idf) >= SIM_THRESHOLD for x in ta for y in tb)
+
+
+def group_stories(items: list[dict]) -> list[dict]:
+    """Regroupe les articles qui parlent du même sujet (titre + extrait, mots rares pondérés)."""
+    unique: dict[str, dict] = {}  # un même article peut être dans deux flux (TechCrunch + TechCrunch AI)
+    for item in items:
+        unique.setdefault(item["link"], item)
+    items = list(unique.values())
+    toks = [item_tokens(i) for i in items]
+    df: dict[str, int] = {}
+    for t in toks:
+        for w in t:
+            df[w] = df.get(w, 0) + 1
+    idf = {w: math.log(len(items) / c) for w, c in df.items()}
+
     clusters: list[dict] = []
-    for item in sorted(items, key=lambda i: i["published"], reverse=True):
-        tokens = title_tokens(item["title"])
+    order = sorted(range(len(items)), key=lambda k: items[k]["published"], reverse=True)
+    for k in order:
         best, best_score = None, 0.0
         for cl in clusters:
-            shared = len(tokens & cl["tokens"])
-            score = shared / min(len(tokens), len(cl["tokens"])) if shared >= 3 else 0
+            score = max(similarity(toks[k], t, idf) for t in cl["toks"])
             if score > best_score:
                 best, best_score = cl, score
-        if best and best_score >= threshold:
-            best["items"].append(item)
+        if best and best_score >= SIM_THRESHOLD:
+            best["items"].append(items[k])
+            best["toks"].append(toks[k])
         else:
-            clusters.append({"tokens": tokens, "items": [item]})
+            clusters.append({"items": [items[k]], "toks": [toks[k]], "idf": idf})
 
     for cl in clusters:
-        cl["sources"] = sorted({i["source"] for i in cl["items"]})
+        names: dict[str, str] = {}
+        for i in cl["items"]:
+            names.setdefault(outlet(i), i["source"])
+        cl["sources"] = sorted(names.values())
         cl["main"] = cl["items"][0]
     clusters.sort(key=lambda c: (len(c["sources"]), c["main"]["published"]), reverse=True)
     return clusters
@@ -290,8 +339,8 @@ def llm_complete(prompt: str, schema: dict, max_tokens: int) -> str:
             "stream": False,
             "format": schema,      # sortie structurée : force un JSON conforme au schéma
             "think": THINK,
-            "keep_alive": "2m",    # libère la RAM peu après la fin
-            "options": {"num_ctx": NUM_CTX, "temperature": 0.3, "num_predict": max_tokens},
+            "keep_alive": KEEP_ALIVE,  # "0" = déchargé après chaque appel (vide le cache de prompts)
+            "options": {"num_ctx": NUM_CTX, "temperature": 0.2, "num_predict": max_tokens},
         },
         timeout=1800,  # CPU seul : peut être lent
     )
@@ -327,30 +376,67 @@ SELECT_SCHEMA = {
 }
 
 
+def categories(cl: dict) -> set[str]:
+    """Domaines d'un sujet : ceux de tous les flux qui en parlent (ex. Cyber + AI)."""
+    return {i["category"] for i in cl["items"]}
+
+
+REQUIRED_CATEGORIES = ("Cyber", "AI")  # au moins un sujet de chaque dans l'email
+
+
+def balance_categories(chosen: list[dict], ranked: list[dict], clusters: list[dict]) -> list[dict]:
+    """Garantit au moins un sujet Cyber et un sujet AI, en remplaçant le dernier sujet
+    d'un domaine sur-représenté par le meilleur sujet du domaine manquant."""
+    for need in REQUIRED_CATEGORIES:
+        if any(need in categories(c) for c in chosen):
+            continue
+        pool = [c for c in ranked if c not in chosen] + [c for c in clusters if c not in chosen]
+        repl = next((c for c in pool if need in categories(c)
+                     and not any(same_story(c, x) for x in chosen)), None)
+        if not repl:
+            continue
+        for k in range(len(chosen) - 1, -1, -1):
+            rest = chosen[:k] + chosen[k + 1:] + [repl]
+            if all(any(r in categories(c) for c in rest) for r in REQUIRED_CATEGORIES
+                   if any(r in categories(c) for c in chosen)):
+                log.info("Équilibre des domaines : « %s » remplace « %s »",
+                         repl["main"]["title"], chosen[k]["main"]["title"])
+                chosen[k] = repl
+                break
+    return chosen
+
+
 def select_stories(clusters: list[dict]) -> list[dict]:
     lines = []
     for idx, cl in enumerate(clusters):
         m = cl["main"]
-        lines.append(
-            f"[{idx}] ({m['category']}) {m['title']} | {m['source']} | "
-            f"{len(cl['sources'])} média(s) | {m['snippet'][:200]}"
-        )
+        n = len(cl["sources"])
+        cats = "+".join(sorted(categories(cl)))
+        lines.append(f"[{idx}] ({cats}, {n} média{'s' if n > 1 else ''}) {m['title']} — {m['snippet'][:140]}")
+    # Ollama tronque sans prévenir un prompt plus long que NUM_CTX : on retire les derniers
+    # candidats (les moins couverts) si besoin. Estimation prudente : 3 caractères par token.
+    while len(lines) > NUM_STORIES and sum(len(x) for x in lines) / 3 > NUM_CTX - 1200:
+        lines.pop()
+    if len(lines) < len(clusters):
+        log.warning("Contexte trop petit : %d candidats sur %d montrés au modèle", len(lines), len(clusters))
+    wanted = NUM_STORIES + 3  # quelques choix de réserve si un doublon est écarté
     prompt = f"""Tu prépares la veille quotidienne pour {AUDIENCE}.
 
-Voici les sujets candidats du jour (IA, tech/IT, cybersécurité).
-Choisis les {NUM_STORIES} sujets LES PLUS importants pour ce public. Règles :
-- Chaque choix doit être un sujet différent.
-- Couvre les trois domaines si possible (au moins un Cyber et un AI).
-- Privilégie : attaques et fuites de données majeures, failles activement
-  exploitées, sorties importantes de modèles ou de produits, réglementation,
-  grands mouvements du secteur. Évite : levées de fonds, tests de gadgets,
-  tribunes d'opinion, mises à jour mineures.
-- Un sujet couvert par plusieurs médias est un signal fort d'importance.
-
-Candidats :
+Sujets candidats du jour (IA, tech/IT, cybersécurité), avec le nombre de médias qui en parlent :
 {chr(10).join(lines)}
 
-Réponds UNIQUEMENT en JSON : {{"picks": [numéros des {NUM_STORIES} sujets choisis]}}"""
+Tâche : classe les {wanted} sujets LES PLUS importants pour ce public, du plus important au moins important.
+Règles :
+- Un sujet repris par plusieurs médias est un signal fort : privilégie-le.
+- Privilégie : attaques et fuites de données majeures, failles activement
+  exploitées, sorties importantes de modèles ou de produits, réglementation,
+  grandes décisions du secteur.
+- Écarte : portraits et interviews, tribunes d'opinion, levées de fonds,
+  tests de gadgets, annonces mineures de petits éditeurs, mises à jour mineures.
+- Si plusieurs candidats parlent du MÊME événement, n'en garde qu'un.
+- Dans les {NUM_STORIES} premiers, mets au moins un sujet Cyber et un sujet AI.
+
+Réponds UNIQUEMENT en JSON : {{"picks": [les {wanted} numéros, du plus important au moins important]}}"""
     try:
         picks = ask_llm(prompt, SELECT_SCHEMA, 200).get("picks") or []
     except RuntimeError as exc:  # JSON invalide / modèle en échec : on ne plante pas
@@ -358,15 +444,22 @@ Réponds UNIQUEMENT en JSON : {{"picks": [numéros des {NUM_STORIES} sujets choi
         picks = []
     if not isinstance(picks, list):
         picks = []
-    chosen = []
+    ranked = []  # choix valides du modèle, dans son ordre, sans doublon
     for p in picks:
         digits = re.search(r"\d+", str(p))
         if not digits:
             continue
         i = int(digits.group())
-        if 0 <= i < len(clusters) and clusters[i] not in chosen:
-            chosen.append(clusters[i])
+        if not 0 <= i < len(lines) or clusters[i] in ranked:
+            continue
+        dup = next((c for c in ranked if same_story(c, clusters[i])), None)
+        if dup:
+            log.info("Doublon écarté : « %s » (même sujet que « %s »)",
+                     clusters[i]["main"]["title"], dup["main"]["title"])
+            continue
+        ranked.append(clusters[i])
     log.info("Sujets choisis par le modèle : %s", picks)
+    chosen = ranked[:NUM_STORIES]
     # Si le modèle en renvoie trop peu, on complète avec les sujets les plus couverts
     # (les candidats sont déjà triés par nombre de médias).
     if len(chosen) < NUM_STORIES:
@@ -374,9 +467,9 @@ Réponds UNIQUEMENT en JSON : {{"picks": [numéros des {NUM_STORIES} sujets choi
     for cl in clusters:
         if len(chosen) >= NUM_STORIES:
             break
-        if cl not in chosen:
+        if cl not in chosen and not any(same_story(c, cl) for c in chosen):
             chosen.append(cl)
-    return chosen[:NUM_STORIES]
+    return balance_categories(chosen, ranked, clusters)
 
 
 # ------------------------------------------------------------- 4. rédaction ---
@@ -427,10 +520,19 @@ Texte de l'article (peut être partiel) : {article_text or '(non disponible)'}
 Liens vers des articles de recherche cités dans l'article : {papers or 'aucun'}
 
 Écris EN FRANÇAIS, avec TES PROPRES MOTS (ne recopie jamais de phrases de l'article) :
-- "title" : un titre clair et factuel (14 mots maximum)
+- "title" : un titre clair et factuel en français (14 mots maximum)
 - "summary" : 2 à 3 phrases : ce qui s'est passé, qui est concerné, faits et chiffres clés
 - "why_it_matters" : 1 à 2 phrases sur l'impact concret pour une équipe IT
   d'entreprise de conseil (risque à vérifier, opportunité, point à surveiller ou action)
+Règles :
+- Utilise UNIQUEMENT les faits présents ci-dessus ; n'invente aucun chiffre, nom ou date.
+- Emploie les termes français courants (identifiants et non « credentials »,
+  faille, rançongiciel, hameçonnage, fuite de données…) ; garde en anglais les
+  noms propres et les sigles (CVE, LLM, API…).
+- Le « pourquoi c'est important » doit être spécifique à ce sujet, pas une
+  recommandation générique valable pour n'importe quelle actu. Ne le commence
+  pas par « Pour une équipe IT » ni « Pour votre équipe » : va droit au fait.
+- Vérifie l'accord en genre et en nombre (une nuisance, des identifiants légitimes).
 - "paper_url" : le lien de la liste ci-dessus qui est L'article de recherche à
   l'origine du sujet, ou null si aucun ne l'est clairement (n'invente jamais de lien)
 - "paper_title" : titre court de cet article de recherche, ou null
@@ -448,15 +550,15 @@ Réponds UNIQUEMENT en JSON avec exactement ces clés."""
         data[key] = str(data[key] or "")
     if data.get("paper_url") not in papers:  # garde-fou contre les liens inventés
         data["paper_url"], data["paper_title"] = None, None
-    others = {}
+    others = {}  # un seul lien par média, sans le média principal
     for it in cluster["items"]:
-        if it["source"] != main["source"]:
-            others.setdefault(it["source"], it["link"])
+        if outlet(it) != outlet(main):
+            others.setdefault(outlet(it), (it["source"], it["link"]))
     data.update(
         category=main["category"],
         link=main["link"],
         source=main["source"],
-        other_sources=list(others.items()),
+        other_sources=list(others.values()),
     )
     return data
 
