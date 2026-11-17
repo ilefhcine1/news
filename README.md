@@ -1,90 +1,68 @@
-# Daily AI · Tech · Cyber Brief
+# Veille quotidienne IA · Tech · Cyber
 
-Every morning at about 7:00 AM (Tunisia time) you get an email with the 5 most important AI, tech/IT and cybersecurity stories (attacks, breaches, exploited vulnerabilities, model releases, regulation and so on).
+Chaque matin vers 7h, un email en français avec les 5 actus les plus importantes
+des dernières 24 h en IA, tech/IT et cybersécurité (attaques, failles, IT en général).
 
-Each story includes:
-- Title
-- Summary
-- Why it matters
-- Source (plus other outlets covering it)
-- Related research paper (arXiv, DOI, OpenReview and others), when one is linked
+Pour chaque actu :
+- titre ;
+- résumé de 2-3 phrases, rédigé avec ses propres mots ;
+- « Pourquoi c'est important » pour une équipe IT d'entreprise de conseil ;
+- source (avec lien) et les autres médias qui l'ont couverte ;
+- article de recherche, **uniquement** s'il est réellement cité dans l'article.
 
-It runs **free**. Pick one LLM:
+**Aucune API d'IA externe** : le modèle (`qwen3.5:4b`) tourne en local avec
+[Ollama](https://ollama.com). Seul l'email sort du PC.
 
-| `LLM_PROVIDER` | Cost | Key | Where it runs |
-|---|---|---|---|
-| `gemini` (default) | free tier | [Google AI Studio](https://aistudio.google.com/apikey), no card needed | GitHub Actions or your PC |
-| `groq` | free tier | [console.groq.com/keys](https://console.groq.com/keys) | GitHub Actions or your PC |
-| `ollama` | free, local | none | your PC only |
-| `custom` | – | any OpenAI-compatible server (LM Studio, OpenRouter…) via `LLM_BASE_URL` | – |
-| `anthropic` | paid | Anthropic key (`pip install anthropic`) | anywhere |
+## Fonctionnement
 
-Each run makes only 6 LLM calls (1 to select stories, 5 to write them), which fits comfortably in the free tiers.
-Free-tier model names change often. If you get a "model not found" error, set `LLM_MODEL` to a current one.
+1. Lecture d'une vingtaine de flux RSS (liste `FEEDS` dans `news_digest.py`).
+2. Regroupement des articles qui parlent du même sujet.
+3. Le modèle choisit les 5 sujets les plus importants parmi `MAX_CANDIDATES`.
+   S'il échoue ou en renvoie moins de 5, on complète avec les sujets les plus couverts.
+4. Pour chaque sujet, le script lit l'article et le modèle rédige titre, résumé et
+   « pourquoi c'est important ». Un lien de recherche n'est affiché que s'il figure
+   dans l'article lui-même (jamais inventé).
+5. Envoi de l'email HTML. Les liens envoyés sont mémorisés dans `seen_urls.json`
+   pour ne jamais envoyer deux fois la même actu.
 
----
-
-## Option A: GitHub Actions + free Gemini key (recommended, PC can stay off)
-
-1. Create a private GitHub repository and upload all files, including `.github/workflows/daily-digest.yml`.
-2. Get a free Gemini API key: https://aistudio.google.com/apikey
-3. Create a Gmail App Password (2-Step Verification must be on): https://myaccount.google.com/apppasswords
-4. Go to **Settings → Secrets and variables → Actions → New repository secret** and add:
-
-| Secret | Value |
-|---|---|
-| `GEMINI_API_KEY` | your Gemini key (or `GROQ_API_KEY` if you use Groq) |
-| `SMTP_USER` | sender Gmail address |
-| `SMTP_PASSWORD` | 16-character Gmail App Password |
-| `EMAIL_TO` | recipient address(es), comma-separated |
-
-   Optional, under the **Variables** tab: `LLM_PROVIDER` (`groq`…) and `LLM_MODEL`.
-5. Test it: **Actions → Daily tech digest → Run workflow**.
-
-The job runs at 05:40 UTC, so the email lands around 07:00 Tunisia time. It saves `seen_urls.json` so a story is never sent twice.
-
-## Option B: 100% local with Ollama + Windows Task Scheduler
-
-No API key, and nothing leaves your PC except the email. The PC must be on (or asleep) at 7:00. If it was off, the task runs as soon as you turn it on.
+## Installation (Windows)
 
 ```powershell
-# 1. Install Ollama from https://ollama.com, then download a model (~4.7 GB)
-ollama pull qwen2.5:7b          # 16 GB RAM: good. 8 GB RAM: try llama3.2:3b
+# 1. Ollama et le modèle (~3,3 Go)
+winget install Ollama.Ollama
+ollama pull qwen3.5:4b
 
-# 2. Install the Python packages
-pip install -r requirements.txt
+# 2. Environnement Python (3.11+)
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
-# 3. Configure
-copy .env.example .env          # set LLM_PROVIDER=ollama + your Gmail settings
+# 3. Configuration
+copy .env.example .env      # puis remplir la partie email
 
-# 4. Test (writes digest.html and sends no email)
-$env:DRY_RUN=1; python news_digest.py; Remove-Item Env:DRY_RUN
+# 4. Essai sans envoi (écrit digest.html, ne touche pas à l'historique)
+$env:DRY_RUN=1; .\.venv\Scripts\python.exe news_digest.py; Remove-Item Env:DRY_RUN
 
-# 5. Schedule it every day at 07:00
+# 5. Planification quotidienne à 06:15
 powershell -ExecutionPolicy Bypass -File setup_task.ps1
 ```
 
-Logs go to `digest.log`. On a CPU-only laptop a run can take 5–15 minutes. Larger models write better summaries.
-You can also use Option B with `LLM_PROVIDER=gemini` if you'd rather run it on your PC than on GitHub.
+La tâche planifiée réveille le PC s'il est en veille (pas s'il est éteint),
+s'exécute dès que possible si 06:15 a été manqué, et fonctionne sur batterie.
+Sur un portable sans GPU dédié, une exécution prend plusieurs minutes.
 
----
+Les logs sont écrits dans `digest.log`.
 
-## Test locally (any provider)
+## Réglages (`.env`)
 
-```powershell
-pip install -r requirements.txt
-copy .env.example .env      # fill in LLM_PROVIDER + key
-$env:DRY_RUN=1; python news_digest.py
-```
-
-This writes `digest.html` instead of sending the email.
-
-## Customize
-
-- **Sources:** edit the `FEEDS` dictionary in `news_digest.py`.
-- **Audience:** `AUDIENCE` changes the tone of "why it matters".
-- **Number of stories:** `NUM_STORIES` (default 5).
-- **Model:** `LLM_MODEL` (each provider has a default).
-- **Rate limits:** `LLM_DELAY` (seconds between calls) and `MAX_CANDIDATES` (stories shown to the LLM). Lower `MAX_CANDIDATES` if a free tier rejects the request as too large.
-- **Ollama context:** `OLLAMA_NUM_CTX` (default 16384).
-- **SMTP server:** `SMTP_HOST` / `SMTP_PORT` (SSL, port 465 by default).
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `LLM_MODEL` | `qwen3.5:4b` | modèle Ollama |
+| `NUM_CTX` | `8192` | taille du contexte ; plus grand = plus de RAM |
+| `MAX_CANDIDATES` | `60` | sujets montrés au modèle pour la sélection |
+| `THINK` | `0` | mode « réflexion » de qwen3.5 (très lent sur CPU) |
+| `NUM_STORIES` | `5` | nombre d'actus dans l'email |
+| `LOOKBACK_HOURS` | `26` | fenêtre de collecte |
+| `AUDIENCE` | équipe IT de conseil | public visé par les prompts |
+| `SMTP_USER`, `SMTP_PASSWORD`, `EMAIL_TO` | – | envoi de l'email (Gmail : mot de passe d'application) |
+| `SMTP_HOST`, `SMTP_PORT` | `smtp.gmail.com`, `465` | serveur SMTP (SSL) |
+| `DRY_RUN` | `0` | `1` = écrit `digest.html` sans envoyer ni mémoriser |

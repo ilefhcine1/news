@@ -1,4 +1,6 @@
 .env
+.venv/
 digest.html
-digest.log
+digest.log*
+seen_urls.json
 __pycache__/
