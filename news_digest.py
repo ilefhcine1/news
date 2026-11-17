@@ -2,11 +2,19 @@
 Daily Tech Digest
 -----------------
 Every morning: collects AI / Tech / Cyber news from RSS feeds, groups duplicate
-stories, asks Claude to pick the 5 most important ones, writes a summary +
+stories, asks an LLM to pick the 5 most important ones, writes a summary +
 "why it matters" for each, finds the linked research paper when there is one,
 and sends everything as an HTML email.
 
+LLM backends (LLM_PROVIDER):
+  gemini     free Google AI Studio key (default)
+  groq       free Groq key
+  ollama     local model, no key, nothing leaves your PC
+  custom     any OpenAI-compatible server (LM Studio, OpenRouter, ...)
+  anthropic  paid Claude API
+
 Run locally:   DRY_RUN=1 python news_digest.py   (writes digest.html, no email)
+Settings can also be put in a .env file next to this script.
 """
 
 import datetime as dt
@@ -23,10 +31,26 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, urljoin
 
-import anthropic
 import feedparser
 import requests
 from bs4 import BeautifulSoup
+
+
+def load_dotenv(path: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")) -> None:
+    """Tiny .env loader (KEY=value lines). Real environment variables win."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+    except FileNotFoundError:
+        pass
+
+
+load_dotenv()
 
 # ---------------------------------------------------------------- settings ---
 
@@ -57,7 +81,31 @@ FEEDS = {
     ],
 }
 
-MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
+# Free-tier model names change often: override with LLM_MODEL if one is retired.
+PROVIDERS = {
+    "gemini": dict(
+        url="https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        key_env="GEMINI_API_KEY", model="gemini-flash-latest", max_candidates=120, delay=6),
+    "groq": dict(  # free tier has a small tokens-per-minute budget: fewer candidates, slower pace
+        url="https://api.groq.com/openai/v1/chat/completions",
+        key_env="GROQ_API_KEY", model="llama-3.3-70b-versatile", max_candidates=45, delay=20),
+    "ollama": dict(
+        url="http://localhost:11434", key_env=None, model="qwen2.5:7b", max_candidates=60, delay=0),
+    "custom": dict(url=None, key_env="LLM_API_KEY", model=None, max_candidates=100, delay=0),
+    "anthropic": dict(
+        url=None, key_env="ANTHROPIC_API_KEY", model="claude-sonnet-5-5", max_candidates=120, delay=0),
+}
+PROVIDER = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
+if PROVIDER not in PROVIDERS:
+    raise SystemExit(f"Unknown LLM_PROVIDER '{PROVIDER}'. Choose one of: {', '.join(PROVIDERS)}")
+_P = PROVIDERS[PROVIDER]
+LLM_URL = os.getenv("LLM_BASE_URL") or _P["url"]
+LLM_MODEL = os.getenv("LLM_MODEL") or _P["model"]
+LLM_KEY = os.getenv(_P["key_env"] or "", "") or os.getenv("LLM_API_KEY", "")
+MAX_CANDIDATES = int(os.getenv("MAX_CANDIDATES", _P["max_candidates"]))
+CALL_DELAY = float(os.getenv("LLM_DELAY", _P["delay"]))  # seconds between LLM calls (free-tier rate limits)
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "16384"))  # Ollama's default context is too small
+
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "26"))
 NUM_STORIES = int(os.getenv("NUM_STORIES", "5"))
 AUDIENCE = os.getenv(
@@ -207,26 +255,98 @@ def group_stories(items: list[dict], threshold: float = 0.5) -> list[dict]:
     return clusters
 
 
-# ------------------------------------------------------------ 3. Claude ---
-
-client = anthropic.Anthropic() if os.getenv("ANTHROPIC_API_KEY") else None
+# --------------------------------------------------------------- 3. LLM ---
 
 
-def ask_claude(prompt: str, max_tokens: int = 1500) -> dict:
-    for attempt in range(3):
+class RateLimited(Exception):
+    def __init__(self, wait: float):
+        super().__init__(f"rate limited, retry in {wait:.0f}s")
+        self.wait = wait
+
+
+def check_llm_config() -> None:
+    """Fail early with a clear message instead of halfway through the run."""
+    if _P["key_env"] and not LLM_KEY:
+        raise SystemExit(f"LLM_PROVIDER={PROVIDER} needs an API key: set {_P['key_env']} (or LLM_API_KEY).")
+    if not LLM_URL and PROVIDER == "custom":
+        raise SystemExit("LLM_PROVIDER=custom needs LLM_BASE_URL (…/v1/chat/completions) and LLM_MODEL.")
+    if not LLM_MODEL:
+        raise SystemExit("Set LLM_MODEL.")
+    if PROVIDER == "ollama":
         try:
-            msg = client.messages.create(
-                model=MODEL,
-                max_tokens=max_tokens,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            text = "".join(b.text for b in msg.content if b.type == "text")
-            text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
-            return json.loads(text[text.find("{"): text.rfind("}") + 1])
+            tags = requests.get(f"{LLM_URL.rstrip('/')}/api/tags", timeout=10).json()
+        except Exception:
+            raise SystemExit(f"Ollama is not reachable at {LLM_URL}. Start the Ollama app (or `ollama serve`).")
+        names = {m["name"] for m in tags.get("models", [])}
+        if LLM_MODEL not in names and f"{LLM_MODEL}:latest" not in names:
+            raise SystemExit(f"Model '{LLM_MODEL}' is not installed. Run: ollama pull {LLM_MODEL}")
+    log.info("LLM: %s / %s", PROVIDER, LLM_MODEL)
+
+
+def llm_complete(prompt: str, max_tokens: int) -> str:
+    messages = [{"role": "user", "content": prompt}]
+
+    if PROVIDER == "ollama":
+        resp = requests.post(
+            f"{LLM_URL.rstrip('/')}/api/chat",
+            json={"model": LLM_MODEL, "messages": messages, "stream": False, "format": "json",
+                  "options": {"num_ctx": OLLAMA_NUM_CTX, "temperature": 0.3}},
+            timeout=900,  # CPU-only machines can be slow
+        )
+        resp.raise_for_status()
+        return resp.json()["message"]["content"]
+
+    if PROVIDER == "anthropic":
+        import anthropic  # optional dependency: pip install anthropic
+
+        msg = anthropic.Anthropic(api_key=LLM_KEY).messages.create(
+            model=LLM_MODEL, max_tokens=max_tokens, messages=messages)
+        return "".join(b.text for b in msg.content if b.type == "text")
+
+    # OpenAI-compatible chat completions (Gemini, Groq, LM Studio, OpenRouter, ...)
+    body = {"model": LLM_MODEL, "messages": messages, "temperature": 0.3}
+    if PROVIDER in ("gemini", "groq"):
+        body["response_format"] = {"type": "json_object"}
+    if PROVIDER != "gemini":  # Gemini counts "thinking" tokens in max_tokens, which can cut the answer
+        body["max_tokens"] = max_tokens
+    resp = requests.post(LLM_URL, json=body, timeout=180,
+                         headers={"Authorization": f"Bearer {LLM_KEY}"} if LLM_KEY else {})
+    if resp.status_code == 429:
+        try:
+            wait = float(resp.headers.get("retry-after", 30))
+        except ValueError:
+            wait = 30.0
+        raise RateLimited(min(max(wait, 5), 120))
+    if resp.status_code >= 400:
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+    return resp.json()["choices"][0]["message"].get("content") or ""
+
+
+def parse_json(text: str) -> dict:
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)  # reasoning models
+    text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
+    return json.loads(text[text.find("{"): text.rfind("}") + 1])
+
+
+_last_call = 0.0
+
+
+def ask_llm(prompt: str, max_tokens: int = 1500) -> dict:
+    global _last_call
+    for attempt in range(4):
+        pause = CALL_DELAY - (time.time() - _last_call)
+        if pause > 0:
+            time.sleep(pause)
+        _last_call = time.time()
+        try:
+            return parse_json(llm_complete(prompt, max_tokens))
+        except RateLimited as exc:
+            log.warning("LLM %s (attempt %d)", exc, attempt + 1)
+            time.sleep(exc.wait)
         except Exception as exc:
-            log.warning("Claude call failed (attempt %d): %s", attempt + 1, exc)
+            log.warning("LLM call failed (attempt %d): %s", attempt + 1, exc)
             time.sleep(5 * (attempt + 1))
-    raise RuntimeError("Claude API failed 3 times")
+    raise RuntimeError(f"LLM ({PROVIDER}/{LLM_MODEL}) failed 4 times")
 
 
 def select_stories(clusters: list[dict]) -> list[dict]:
@@ -252,13 +372,25 @@ Candidates:
 {chr(10).join(lines)}
 
 Answer ONLY with JSON: {{"picks": [{{"id": <number>, "category": "Cyber|AI|Tech"}}]}}"""
-    picks = ask_claude(prompt, 500)["picks"]
+    picks = ask_llm(prompt, 500).get("picks") or []
     chosen = []
     for p in picks:
-        i = int(p["id"])
+        if not isinstance(p, dict):
+            p = {"id": p}
+        digits = re.search(r"\d+", str(p.get("id", "")))  # small models sometimes answer "[3]" or "3"
+        if not digits:
+            continue
+        i = int(digits.group())
         if 0 <= i < len(clusters) and clusters[i] not in chosen:
-            clusters[i]["category"] = p.get("category", clusters[i]["main"]["category"])
+            cat = p.get("category")
+            clusters[i]["category"] = cat if cat in BADGE else clusters[i]["main"]["category"]
             chosen.append(clusters[i])
+    # If the model returned too few picks, top up with the most widely covered stories.
+    for cl in clusters:
+        if len(chosen) >= NUM_STORIES:
+            break
+        if cl not in chosen:
+            chosen.append(cl)
     return chosen[:NUM_STORIES]
 
 
@@ -306,7 +438,16 @@ Write in English, in your OWN words (never copy sentences from the article):
 - "paper_title": short title of that paper, or null
 
 Answer ONLY with JSON with exactly those keys."""
-    data = ask_claude(prompt, 800)
+    try:
+        data = ask_llm(prompt, 800)
+    except RuntimeError as exc:  # one failed story should not kill the whole digest
+        log.warning("Using feed text for '%s': %s", main["title"], exc)
+        data = {}
+    data.setdefault("title", main["title"])
+    data.setdefault("summary", main["snippet"] or "(no summary available)")
+    data.setdefault("why_it_matters", "")
+    for key in ("title", "summary", "why_it_matters"):
+        data[key] = str(data[key] or "")
     if data.get("paper_url") not in papers:  # guard against invented links
         data["paper_url"], data["paper_title"] = None, None
     data.update(
@@ -402,8 +543,7 @@ def save_seen(seen: set[str], new_links: list[str]) -> None:
 
 
 def main() -> None:
-    if client is None:
-        raise SystemExit("Set ANTHROPIC_API_KEY first.")
+    check_llm_config()
     seen = load_seen()
     items = [i for i in collect() if i["link"] not in seen]
     log.info("Collected %d new articles", len(items))
@@ -411,7 +551,7 @@ def main() -> None:
         log.info("Nothing new today — no email sent.")
         return
 
-    clusters = group_stories(items)[:120]
+    clusters = group_stories(items)[:MAX_CANDIDATES]
     log.info("Grouped into %d candidate stories", len(clusters))
     chosen = select_stories(clusters)
     stories = [write_story(cl) for cl in chosen]
